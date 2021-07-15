@@ -1097,9 +1097,11 @@ DROP FUNCTION f_test(int);
 -- conversion error
 -- ===================================================================
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE int;
-SELECT * FROM ft1 WHERE c1 = 1;  -- ERROR
-SELECT  ft1.c1,  ft2.c2, ft1.c8 FROM ft1, ft2 WHERE ft1.c1 = ft2.c1 AND ft1.c1 = 1; -- ERROR
-SELECT  ft1.c1,  ft2.c2, ft1 FROM ft1, ft2 WHERE ft1.c1 = ft2.c1 AND ft1.c1 = 1; -- ERROR
+SELECT * FROM ft1 ftx(x1,x2,x3,x4,x5,x6,x7,x8) WHERE x1 = 1;  -- ERROR
+SELECT ftx.x1, ft2.c2, ftx.x8 FROM ft1 ftx(x1,x2,x3,x4,x5,x6,x7,x8), ft2
+  WHERE ftx.x1 = ft2.c1 AND ftx.x1 = 1; -- ERROR
+SELECT ftx.x1, ft2.c2, ftx FROM ft1 ftx(x1,x2,x3,x4,x5,x6,x7,x8), ft2
+  WHERE ftx.x1 = ft2.c1 AND ftx.x1 = 1; -- ERROR
 SELECT sum(c2), array_agg(c8) FROM ft1 GROUP BY c8; -- ERROR
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE user_enum;
 
@@ -1858,6 +1860,27 @@ select * from bar where f1 in (select f1 from foo) for update;
 explain (verbose, costs off)
 select * from bar where f1 in (select f1 from foo) for share;
 select * from bar where f1 in (select f1 from foo) for share;
+
+-- Now check SELECT FOR UPDATE/SHARE with an inherited source table,
+-- where the parent is itself a foreign table
+create table loct4 (f1 int, f2 int, f3 int);
+create foreign table foo2child (f3 int) inherits (foo2)
+  server loopback options (table_name 'loct4');
+
+explain (verbose, costs off)
+select * from bar where f1 in (select f1 from foo2) for share;
+select * from bar where f1 in (select f1 from foo2) for share;
+
+drop foreign table foo2child;
+
+-- And with a local child relation of the foreign table parent
+create table foo2child (f3 int) inherits (foo2);
+
+explain (verbose, costs off)
+select * from bar where f1 in (select f1 from foo2) for share;
+select * from bar where f1 in (select f1 from foo2) for share;
+
+drop table foo2child;
 
 -- Check UPDATE with inherited target and an inherited source table
 explain (verbose, costs off)

@@ -801,11 +801,9 @@ static XLogSegNo openLogSegNo = 0;
 
 /*
  * These variables are used similarly to the ones above, but for reading
- * the XLOG.  Note, however, that readOff generally represents the offset
- * of the page just read, not the seek position of the FD itself, which
- * will be just past that page. readLen indicates how much of the current
- * page has been read into readBuf, and readSource indicates where we got
- * the currently open file from.
+ * the XLOG.  readOff is the offset of the page just read, readLen
+ * indicates how much of it has been read into readBuf, and readSource
+ * indicates where we got the currently open file from.
  * Note: we could use Reserve/ReleaseExternalFD to track consumption of
  * this FD too; but it doesn't currently seem worthwhile, since the XLOG is
  * not read by general-purpose sessions.
@@ -5766,7 +5764,7 @@ recoveryStopsBefore(XLogReaderState *record)
 		xl_xact_abort *xlrec = (xl_xact_abort *) XLogRecGetData(record);
 		xl_xact_parsed_abort parsed;
 
-		isCommit = true;
+		isCommit = false;
 		ParseAbortRecord(XLogRecGetInfo(record),
 						 xlrec,
 						 &parsed);
@@ -11718,7 +11716,7 @@ read_tablespace_map(List **tablespaces)
 		}
 		else if ((ch == '\n' || ch == '\r') && prev_ch == '\\')
 			str[i - 1] = ch;
-		else
+		else if (i < sizeof(str) - 1)
 			str[i++] = ch;
 		prev_ch = ch;
 	}
@@ -12403,11 +12401,19 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 						 * pg_wal by now.  Use XLOG_FROM_STREAM so that source
 						 * info is set correctly and XLogReceiptTime isn't
 						 * changed.
+						 *
+						 * NB: We must set readTimeLineHistory based on
+						 * recoveryTargetTLI, not receiveTLI. Normally they'll
+						 * be the same, but if recovery_target_timeline is
+						 * 'latest' and archiving is configured, then it's
+						 * possible that we managed to retrieve one or more
+						 * new timeline history files from the archive,
+						 * updating recoveryTargetTLI.
 						 */
 						if (readFile < 0)
 						{
 							if (!expectedTLEs)
-								expectedTLEs = readTimeLineHistory(receiveTLI);
+								expectedTLEs = readTimeLineHistory(recoveryTargetTLI);
 							readFile = XLogFileRead(readSegNo, PANIC,
 													receiveTLI,
 													XLOG_FROM_STREAM, false);

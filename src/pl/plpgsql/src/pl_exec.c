@@ -38,6 +38,7 @@
 #include "plpgsql.h"
 #include "storage/proc.h"
 #include "tcop/cmdtag.h"
+#include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
@@ -2146,7 +2147,6 @@ exec_stmt_call(PLpgSQL_execstate *estate, PLpgSQL_stmt_call *stmt)
 	PLpgSQL_variable *volatile cur_target = stmt->target;
 	volatile LocalTransactionId before_lxid;
 	LocalTransactionId after_lxid;
-	volatile bool pushed_active_snap = false;
 	volatile int rc;
 
 	/*
@@ -2184,9 +2184,8 @@ exec_stmt_call(PLpgSQL_execstate *estate, PLpgSQL_stmt_call *stmt)
 			Assert(!expr->expr_simple_expr);
 
 			/*
-			 * The procedure call could end transactions, which would upset
-			 * the snapshot management in SPI_execute*, so don't let it do it.
-			 * Instead, we set the snapshots ourselves below.
+			 * Tell SPI to allow non-atomic execution.  (The field name is a
+			 * legacy choice.)
 			 */
 			plan->no_snapshots = true;
 
@@ -2328,16 +2327,6 @@ exec_stmt_call(PLpgSQL_execstate *estate, PLpgSQL_stmt_call *stmt)
 
 		before_lxid = MyProc->lxid;
 
-		/*
-		 * Set snapshot only for non-read-only procedures, similar to SPI
-		 * behavior.
-		 */
-		if (!estate->readonly_func)
-		{
-			PushActiveSnapshot(GetTransactionSnapshot());
-			pushed_active_snap = true;
-		}
-
 		rc = SPI_execute_plan_with_paramlist(expr->plan, paramLI,
 											 estate->readonly_func, 0);
 	}
@@ -2372,17 +2361,7 @@ exec_stmt_call(PLpgSQL_execstate *estate, PLpgSQL_stmt_call *stmt)
 
 	after_lxid = MyProc->lxid;
 
-	if (before_lxid == after_lxid)
-	{
-		/*
-		 * If we are still in the same transaction after the call, pop the
-		 * snapshot that we might have pushed.  (If it's a new transaction,
-		 * then all the snapshots are gone already.)
-		 */
-		if (pushed_active_snap)
-			PopActiveSnapshot();
-	}
-	else
+	if (before_lxid != after_lxid)
 	{
 		/*
 		 * If we are in a new transaction after the call, we need to build new
@@ -4580,7 +4559,7 @@ exec_stmt_dynfors(PLpgSQL_execstate *estate, PLpgSQL_stmt_dynfors *stmt)
 	int			rc;
 
 	portal = exec_dynquery_with_params(estate, stmt->query, stmt->params,
-									   NULL, 0);
+									   NULL, CURSOR_OPT_NO_SCROLL);
 
 	/*
 	 * Execute the loop
@@ -4946,6 +4925,7 @@ exec_stmt_rollback(PLpgSQL_execstate *estate, PLpgSQL_stmt_rollback *stmt)
  *
  * We just parse and execute the statement normally, but we have to do it
  * without setting a snapshot, for things like SET TRANSACTION.
+ * XXX spi.c now handles this correctly, so we no longer need a special case.
  */
 static int
 exec_stmt_set(PLpgSQL_execstate *estate, PLpgSQL_stmt_set *stmt)
@@ -4954,10 +4934,7 @@ exec_stmt_set(PLpgSQL_execstate *estate, PLpgSQL_stmt_set *stmt)
 	int			rc;
 
 	if (expr->plan == NULL)
-	{
 		exec_prepare_plan(estate, expr, 0, true);
-		expr->plan->no_snapshots = true;
-	}
 
 	rc = SPI_execute_plan(expr->plan, NULL, NULL, estate->readonly_func, 0);
 
@@ -5927,14 +5904,21 @@ exec_run_select(PLpgSQL_execstate *estate,
 	 * On the first call for this expression generate the plan.
 	 *
 	 * If we don't need to return a portal, then we're just going to execute
-	 * the query once, which means it's OK to use a parallel plan, even if the
-	 * number of rows being fetched is limited.  If we do need to return a
-	 * portal, the caller might do cursor operations, which parallel query
-	 * can't support.
+	 * the query immediately, which means it's OK to use a parallel plan, even
+	 * if the number of rows being fetched is limited.  If we do need to
+	 * return a portal (i.e., this is for a FOR loop), the user's code might
+	 * invoke additional operations inside the FOR loop, making parallel query
+	 * unsafe.  In any case, we don't expect any cursor operations to be done,
+	 * so specify NO_SCROLL for efficiency and semantic safety.
 	 */
 	if (expr->plan == NULL)
-		exec_prepare_plan(estate, expr,
-						  portalP == NULL ? CURSOR_OPT_PARALLEL_OK : 0, true);
+	{
+		int			cursorOptions = CURSOR_OPT_NO_SCROLL;
+
+		if (portalP == NULL)
+			cursorOptions |= CURSOR_OPT_PARALLEL_OK;
+		exec_prepare_plan(estate, expr, cursorOptions, true);
+	}
 
 	/*
 	 * Set up ParamListInfo to pass to executor
@@ -6000,6 +5984,17 @@ exec_for_query(PLpgSQL_execstate *estate, PLpgSQL_stmt_forq *stmt,
 	 * execute.
 	 */
 	PinPortal(portal);
+
+	/*
+	 * In a non-atomic context, we dare not prefetch, even if it would
+	 * otherwise be safe.  Aside from any semantic hazards that that might
+	 * create, if we prefetch toasted data and then the user commits the
+	 * transaction, the toast references could turn into dangling pointers.
+	 * (Rows we haven't yet fetched from the cursor are safe, because the
+	 * PersistHoldablePortal mechanism handles this scenario.)
+	 */
+	if (!estate->atomic)
+		prefetch_ok = false;
 
 	/*
 	 * Fetch the initial tuple(s).  If prefetching is allowed then we grab a
@@ -6178,6 +6173,15 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	if (unlikely(expr->expr_simple_in_use) &&
 		expr->expr_simple_lxid == curlxid)
 		return false;
+
+	/*
+	 * Ensure that there's a portal-level snapshot, in case this simple
+	 * expression is the first thing evaluated after a COMMIT or ROLLBACK.
+	 * We'd have to do this anyway before executing the expression, so we
+	 * might as well do it now to ensure that any possible replanning doesn't
+	 * need to take a new snapshot.
+	 */
+	EnsurePortalSnapshotExists();
 
 	/*
 	 * Check to see if the cached plan has been invalidated.  If not, and this
